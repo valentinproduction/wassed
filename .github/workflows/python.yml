@@ -2,9 +2,9 @@ name: Python application test
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master, test ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main, master, test ]
   workflow_dispatch:
 
 jobs:
