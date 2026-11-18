@@ -1,99 +1,96 @@
+import httpx
 from fastapi import FastAPI, HTTPException, status
+from typing import List
 from pydantic import BaseModel
-from typing import List, Dict
-import requests
-from datetime import date, timedelta
+import sqlalchemy
+from database import database, orders, order_items
 
-PRODUCT_SERVICE_URL = "http://localhost:8080/products"
-
-app = FastAPI()
-
-
-class OrderItem(BaseModel):
+# --- Моделі Pydantic (контракт API) ---
+class OrderItemPayload(BaseModel):
     product_id: int
     quantity: int
 
-
-class Order(BaseModel):
+class OrderItemResponse(OrderItemPayload):
     id: int
-    items: List[OrderItem]
-    total_amount: float = 0.0
-    deliveryDate: str
+    order_id: int
 
-    def set_delivery_date(self):
-        """Встановлює дату доставки: поточна дата + 5 днів."""
-        self.deliveryDate = (date.today() + timedelta(days=5)).isoformat()
+class OrderResponse(BaseModel):
+    id: int
+    total_amount: float
+    items: List[OrderItemResponse]
 
+app = FastAPI()
 
-orders: Dict[int, Order] = {}
-order_id_counter = 0
+@app.on_event("startup")
+async def startup():
+    await database.connect()
 
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
-@app.get("/orders", response_model=List[Order])
-def get_all_orders():
-    return list(orders.values())
+PRODUCT_SERVICE_URL = "http://localhost:8080/products"
 
-
-@app.get("/orders/{order_id}", response_model=Order)
-def get_order_by_id(order_id: int):
-    if order_id not in orders:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
-        )
-
-    return orders[order_id]
-
-
-@app.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
-def create_order(order_items: List[OrderItem]):
+@app.post("/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+async def create_order(order_items_payload: List[OrderItemPayload]):
     total_amount = 0.0
-    validated_items = []
 
-    for item in order_items:
-        try:
-            response = requests.get(
-                f"{PRODUCT_SERVICE_URL}/{item.product_id}"
-            )
-
-            if response.status_code == 200:
-                product_data = response.json()
-
-                total_amount += product_data["price"] * item.quantity
-                validated_items.append(item)
-
-            elif response.status_code == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Product with id {item.product_id} not found."
-                )
-
-            else:
+    # Використовуємо асинхронний клієнт httpx замість requests
+    async with httpx.AsyncClient() as client:
+        for item in order_items_payload:
+            try:
+                response = await client.get(f"{PRODUCT_SERVICE_URL}/{item.product_id}")
+                if response.status_code == 200:
+                    product_data = response.json()
+                    total_amount += product_data['price'] * item.quantity
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Product with id {item.product_id} not found."
+                    )
+            except httpx.RequestError:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Product service is unavailable."
+                    detail="Cannot connect to Product service."
                 )
 
-        except requests.exceptions.RequestException:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Cannot connect to Product service."
-            )
+    query = orders.insert().values(total_amount=total_amount)
+    last_record_id = await database.execute(query)
 
-    global order_id_counter
-    order_id_counter += 1
-    new_id = order_id_counter
+    items_to_insert = [
+        {
+            "order_id": last_record_id,
+            "product_id": item.product_id,
+            "quantity": item.quantity
+        }
+        for item in order_items_payload
+    ]
 
-    new_order = Order(
-        id=new_id,
-        items=validated_items,
-        total_amount=total_amount,
-        deliveryDate=""
-    )
+    query = order_items.insert().values(items_to_insert)
+    await database.execute(query)
 
-    # Поточна дата + 5 днів
-    new_order.set_delivery_date()
+    # Отримуємо щойно створені items для відповіді
+    query = order_items.select().where(order_items.c.order_id == last_record_id)
+    created_items = await database.fetch_all(query)
 
-    orders[new_id] = new_order
+    return {
+        "id": last_record_id,
+        "total_amount": total_amount,
+        "items": created_items
+    }
 
-    return new_order
+@app.get("/orders", response_model=List[OrderResponse])
+async def get_all_orders():
+    query = orders.select()
+    all_orders = await database.fetch_all(query)
+
+    results = []  # Виправлено синтаксичну помилку
+    for order in all_orders:
+        query = order_items.select().where(order_items.c.order_id == order.id)
+        items = await database.fetch_all(query)
+        results.append({
+            "id": order.id,
+            "total_amount": order.total_amount,
+            "items": items
+        })
+    return results
